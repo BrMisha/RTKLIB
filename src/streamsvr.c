@@ -4,6 +4,7 @@
 *          Copyright (C) 2010-2020 by T.TAKASU, All rights reserved.
 *
 * options : -DWIN32    use WIN32 API
+*           -DUNISTD   force include unistd.h
 *
 * version : $Revision:$ $Date:$
 * history : 2010/07/18 1.0  moved from stream.c
@@ -32,6 +33,7 @@
 *                           delete API strsvrsetsrctbl()
 *                           use integer types in stdint.h
 *-----------------------------------------------------------------------------*/
+#include <unistd.h>
 #include "rtklib.h"
 
 /* test observation data message ---------------------------------------------*/
@@ -517,10 +519,14 @@ static void *strsvrthread(void *arg)
             unlock(&svr->lock);
         }
         for (i=1;i<svr->nstr;i++) {
-            
+
             /* read message from output stream */
             while ((n=strread(svr->stream+i,buff,sizeof(buff)))>0) {
-                
+
+                /* pipe bytes to gps_pos_thread for NMEA parsing */
+                if (svr->serial_pipe_fd>=0) {
+                    if (write(svr->serial_pipe_fd,buff,n)<0) {}
+                }
                 /* relay back message from output stream to input stream */
                 if (i==svr->relayback) {
                     strwrite(svr->stream,buff,n);
@@ -534,10 +540,12 @@ static void *strsvrthread(void *arg)
             periodic_cmd(cyc*svr->cycle,svr->cmds_periodic[i],svr->stream+i);
         }
         /* write nmea messages to input stream */
-        if (svr->nmeacycle>0&&(int)(tick-tick_nmea)>=svr->nmeacycle) {
+        if (svr->nmeapos_valid&&svr->nmeacycle>0&&(int)(tick-tick_nmea)>=svr->nmeacycle) {
             sol_nmea.stat=SOLQ_SINGLE;
             sol_nmea.time=utc2gpst(timeget());
+            lock(&svr->nmeapos_lock);
             matcpy(sol_nmea.rr,svr->nmeapos,3,1);
+            unlock(&svr->nmeapos_lock);
             strsendnmea(svr->stream,&sol_nmea);
             tick_nmea=tick;
         }
@@ -579,6 +587,9 @@ extern void strsvrinit(strsvr_t *svr, int nout)
     for (i=0;i<16;i++) svr->conv[i]=NULL;
     svr->thread=0;
     initlock(&svr->lock);
+    svr->serial_pipe_fd=-1;
+    initlock(&svr->nmeapos_lock);
+    svr->nmeapos_valid=0;
 }
 /* start stream server ---------------------------------------------------------
 * start stream server

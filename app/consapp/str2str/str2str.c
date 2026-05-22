@@ -28,18 +28,40 @@
 *           2016/09/17  1.16 add option -b
 *           2017/05/26  1.17 add input format tersus
 *           2020/11/30  1.18 support api change strsvrstart(),strsvrstat()
+*           2024/xx/xx  1.19 add -pg (bidirectional serial + NMEA pipe)
+*                            add -nmea host:port (TCP NMEA server)
 *-----------------------------------------------------------------------------*/
 #include <signal.h>
+#include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
+#include <math.h>
 #include "rtklib.h"
 
 #define PRGNAME     "str2str"          /* program name */
 #define MAXSTR      5                  /* max number of streams */
 #define TRFILE      "str2str.trace"    /* trace file */
+#define NMEA_MAX_CLIENTS 8             /* max TCP NMEA clients */
 
 /* global variables ----------------------------------------------------------*/
 static strsvr_t strsvr;                /* stream server */
 static volatile int intrflg=0;         /* interrupt flag */
+
+/* NMEA TCP server state */
+static volatile int gps_ready=0;
+static int nmeatcp=-1;                 /* NMEA TCP server socket */
+static int nmea_clients[NMEA_MAX_CLIENTS];
+static int nmea_nclient=0;
+static pthread_mutex_t nmea_mutex=PTHREAD_MUTEX_INITIALIZER;
+static int nmea_pipe[2]={-1,-1};
+static pthread_t nmea_tid=0;
+static char nmea_svr_host[64]="0.0.0.0";
+static int nmea_svr_port=0;
 
 /* help text -----------------------------------------------------------------*/
 static const char *help[]={
@@ -109,13 +131,15 @@ static const char *help[]={
 " -b  str_no        relay back messages from output str to input str [no]",
 " -t  level         trace level [0]",
 " -fl file          log file [str2str.trace]",
+" -pg               enable bidirectional serial: read NMEA from -out serial stream",
+" -nmea [host:]port  broadcast NMEA (from -pg) over TCP (e.g. 0.0.0.0:9999)",
 " -h                print help",
 };
 /* print help ----------------------------------------------------------------*/
 static void printhelp(void)
 {
     int i;
-    for (i=0;i<sizeof(help)/sizeof(*help);i++) fprintf(stderr,"%s\n",help[i]);
+    for (i=0;i<(int)(sizeof(help)/sizeof(*help));i++) fprintf(stderr,"%s\n",help[i]);
     exit(0);
 }
 /* signal handler ------------------------------------------------------------*/
@@ -127,9 +151,9 @@ static void sigfunc(int sig)
 static void decodefmt(char *path, int *fmt)
 {
     char *p;
-    
+
     *fmt=-1;
-    
+
     if ((p=strrchr(path,'#'))) {
         if      (!strcmp(p,"#rtcm2")) *fmt=STRFMT_RTCM2;
         else if (!strcmp(p,"#rtcm3")) *fmt=STRFMT_RTCM3;
@@ -152,12 +176,12 @@ static void decodefmt(char *path, int *fmt)
 static int decodepath(const char *path, int *type, char *strpath, int *fmt)
 {
     char buff[1024],*p;
-    
+
     strcpy(buff,path);
-    
+
     /* decode format */
     decodefmt(buff,fmt);
-    
+
     /* decode type */
     if (!(p=strstr(buff,"://"))) {
         strcpy(strpath,buff);
@@ -184,11 +208,11 @@ static void readcmd(const char *file, char *cmd, int type)
     FILE *fp;
     char buff[MAXSTR],*p=cmd;
     int i=0;
-    
+
     *p='\0';
-    
+
     if (!(fp=fopen(file,"r"))) return;
-    
+
     while (fgets(buff,sizeof(buff),fp)) {
         if (*buff=='@') i++;
         else if (i==type&&p+strlen(buff)+1<cmd+MAXRCVCMD) {
@@ -196,6 +220,177 @@ static void readcmd(const char *file, char *cmd, int type)
         }
     }
     fclose(fp);
+}
+/* validate NMEA checksum ----------------------------------------------------*/
+static int nmea_checksum_ok(const char *line)
+{
+    const char *p;
+    char *star;
+    unsigned char sum=0;
+    unsigned int given;
+
+    if (*line!='$') return 0;
+    star=strchr(line,'*');
+    if (!star||star-line<2) return 0;
+    for (p=line+1;p<star;p++) sum^=(unsigned char)*p;
+    return sscanf(star+1,"%2X",&given)==1&&sum==(unsigned char)given;
+}
+/* parse GGA sentence, return geodetic pos in pos[3] (rad,rad,m ellipsoidal) */
+static int parse_gga(const char *line, double pos[3])
+{
+    double latdm=0.0,londm=0.0,alt=0.0,geoid=0.0;
+    char ns='N',ew='E';
+    int q=0;
+
+    if (sscanf(line,"$%*5s,%*[^,],%lf,%c,%lf,%c,%d,%*d,%*f,%lf,%*c,%lf",
+               &latdm,&ns,&londm,&ew,&q,&alt,&geoid)<6) return 0;
+    if (q==0) return 0;
+
+    pos[0]=((int)(latdm/100.0)+fmod(latdm,100.0)/60.0)*D2R;
+    pos[1]=((int)(londm/100.0)+fmod(londm,100.0)/60.0)*D2R;
+    pos[2]=alt+geoid;
+    if (ns=='S') pos[0]=-pos[0];
+    if (ew=='W') pos[1]=-pos[1];
+    return 1;
+}
+/* broadcast NMEA line to all TCP clients ------------------------------------*/
+static void nmea_broadcast(const char *line, int len)
+{
+    int i,j;
+
+    pthread_mutex_lock(&nmea_mutex);
+    for (i=j=0;i<nmea_nclient;i++) {
+        if (send(nmea_clients[i],line,len,MSG_NOSIGNAL)>0) {
+            nmea_clients[j++]=nmea_clients[i];
+        } else {
+            close(nmea_clients[i]);
+        }
+    }
+    nmea_nclient=j;
+    pthread_mutex_unlock(&nmea_mutex);
+}
+/* GPS position thread: reads NMEA from pipe, updates nmeapos, broadcasts ----*/
+static void *gps_pos_thread(void *arg)
+{
+    int pipefd=*(int *)arg;
+    char buf[4096],line[512];
+    int buflen=0;
+    ssize_t n;
+    double geopos[3],ecef[3];
+
+    fprintf(stderr,"[GPS] NMEA reader started (pipe from serial)\n");
+
+    while (1) {
+        char *p,*q;
+        n=read(pipefd,buf+buflen,(size_t)(sizeof(buf)-buflen-1));
+        if (n<=0) break;
+        buflen+=(int)n;
+        buf[buflen]='\0';
+        p=buf;
+
+        while ((q=memchr(p,'\n',buf+buflen-p))) {
+            int len=(int)(q-p);
+            if (len>0&&p[len-1]=='\r') len--;
+            if (len>0&&len<(int)sizeof(line)-1) {
+                memcpy(line,p,len);
+                line[len]='\0';
+
+                if (nmea_checksum_ok(line)) {
+                    char out[520];
+                    int olen=sprintf(out,"%s\r\n",line);
+                    if (nmea_nclient>0) nmea_broadcast(out,olen);
+
+                    if ((strncmp(line,"$GNGGA",6)==0||
+                         strncmp(line,"$GPGGA",6)==0)&&
+                        parse_gga(line,geopos)) {
+                        pos2ecef(geopos,ecef);
+                        lock(&strsvr.nmeapos_lock);
+                        matcpy(strsvr.nmeapos,ecef,3,1);
+                        strsvr.nmeapos_valid=1;
+                        unlock(&strsvr.nmeapos_lock);
+                        fprintf(stderr,"[GPS] pos updated: lat=%.6f lon=%.6f alt=%.1f\n",
+                                geopos[0]/D2R,geopos[1]/D2R,geopos[2]);
+                        if (!gps_ready) {
+                            fprintf(stderr,"[GPS] initial position: lat=%.6f lon=%.6f alt=%.1f\n",
+                                    geopos[0]/D2R,geopos[1]/D2R,geopos[2]);
+                            gps_ready=1;
+                        }
+                    }
+                }
+            }
+            p=q+1;
+        }
+        buflen=(int)(buf+buflen-p);
+        if (buflen>0) memmove(buf,p,buflen);
+    }
+    return NULL;
+}
+/* NMEA TCP accept thread ----------------------------------------------------*/
+static void *nmea_accept_thread(void *arg)
+{
+    int nmea_sid=*(int *)arg;
+    struct sockaddr_in caddr;
+    socklen_t caddrlen=sizeof(caddr);
+    int cfd,opt=1;
+
+    fprintf(stderr,"[NMEA] TCP server listening on %s:%d\n",
+            nmea_svr_host,nmea_svr_port);
+
+    while (!intrflg) {
+        cfd=accept(nmea_sid,(struct sockaddr *)&caddr,&caddrlen);
+        if (cfd<0) break;
+
+        setsockopt(cfd,IPPROTO_TCP,TCP_NODELAY,&opt,sizeof(opt));
+
+        pthread_mutex_lock(&nmea_mutex);
+        if (nmea_nclient<NMEA_MAX_CLIENTS) {
+            nmea_clients[nmea_nclient++]=cfd;
+            fprintf(stderr,"@[NMEA] client +%s (%d total)\n",
+                    inet_ntoa(caddr.sin_addr),nmea_nclient);
+        } else {
+            fprintf(stderr,"[NMEA] max clients reached, connection rejected\n");
+            close(cfd);
+        }
+        pthread_mutex_unlock(&nmea_mutex);
+    }
+    return NULL;
+}
+/* start NMEA TCP server -----------------------------------------------------*/
+static int nmea_server_start(const char *host, int port,
+                              struct sockaddr_in *addr_out)
+{
+    struct sockaddr_in addr;
+    int nmea_sid,opt=1;
+
+    if ((nmea_sid=socket(AF_INET,SOCK_STREAM,0))<0) {
+        fprintf(stderr,"nmea socket\n");
+        return -1;
+    }
+    setsockopt(nmea_sid,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
+
+    memset(&addr,0,sizeof(addr));
+    addr.sin_family=AF_INET;
+    addr.sin_port=htons((uint16_t)port);
+    addr.sin_addr.s_addr=inet_addr(host);
+
+    if (bind(nmea_sid,(struct sockaddr *)&addr,sizeof(addr))<0) {
+        fprintf(stderr,"nmea bind\n");
+        close(nmea_sid);
+        return -1;
+    }
+    if (listen(nmea_sid,8)<0) {
+        fprintf(stderr,"nmea listen\n");
+        close(nmea_sid);
+        return -1;
+    }
+    if (addr_out) *addr_out=addr;
+    return nmea_sid;
+}
+/* wait for initial GPS position from serial ---------------------------------*/
+static void wait_initial_position(const char *serialdev)
+{
+    fprintf(stderr,"[GPS] waiting for initial position from %s ...\n",serialdev);
+    while (!gps_ready&&!intrflg) sleepms(200);
 }
 /* str2str -------------------------------------------------------------------*/
 int main(int argc, char **argv)
@@ -214,7 +409,11 @@ int main(int argc, char **argv)
     int i,j,n=0,dispint=5000,trlevel=0,opts[]={10000,10000,2000,32768,10,0,30,0};
     int types[MAXSTR]={STR_FILE,STR_FILE},stat[MAXSTR]={0},log_stat[MAXSTR]={0};
     int byte[MAXSTR]={0},bps[MAXSTR]={0},fmts[MAXSTR]={0},sta=0;
-    
+    int pgflag=0;
+    int stapos_set=0;
+    char serialdev[256]="";
+    pthread_t gps_tid=0;
+
     for (i=0;i<MAXSTR;i++) {
         paths[i]=s1[i];
         logs[i]=s2[i];
@@ -234,11 +433,13 @@ int main(int argc, char **argv)
             pos[1]=atof(argv[++i])*D2R;
             pos[2]=atof(argv[++i]);
             pos2ecef(pos,stapos);
+            stapos_set=1;
         }
         else if (!strcmp(argv[i],"-px")&&i+3<argc) {
             stapos[0]=atof(argv[++i]);
             stapos[1]=atof(argv[++i]);
             stapos[2]=atof(argv[++i]);
+            stapos_set=1;
         }
         else if (!strcmp(argv[i],"-o")&&i+3<argc) {
             stadel[0]=atof(argv[++i]);
@@ -265,10 +466,24 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i],"-b"  )&&i+1<argc) opts[7]=atoi(argv[++i]);
         else if (!strcmp(argv[i],"-fl" )&&i+1<argc) logfile=argv[++i];
         else if (!strcmp(argv[i],"-t"  )&&i+1<argc) trlevel=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"-pg" )) pgflag=1;
+        else if (!strcmp(argv[i],"-nmea")&&i+1<argc) {
+            char *spec=argv[++i],*colon=strchr(spec,':');
+            if (colon) {
+                int hlen=(int)(colon-spec);
+                if (hlen>0&&hlen<(int)sizeof(nmea_svr_host)) {
+                    memcpy(nmea_svr_host,spec,hlen);
+                    nmea_svr_host[hlen]='\0';
+                }
+                nmea_svr_port=atoi(colon+1);
+            } else {
+                nmea_svr_port=atoi(spec);
+            }
+        }
         else if (*argv[i]=='-') printhelp();
     }
     if (n<=0) n=1; /* stdout */
-    
+
     for (i=0;i<n;i++) {
         if (fmts[i+1]<=0) continue;
         if (fmts[i+1]!=STRFMT_RTCM3) {
@@ -300,18 +515,63 @@ int main(int argc, char **argv)
     signal(SIGINT ,sigfunc);
     signal(SIGHUP ,SIG_IGN);
     signal(SIGPIPE,SIG_IGN);
-    
+
     strsvrinit(&strsvr,n+1);
-    
+
+    /* setup pipe and serial device name for -pg mode */
+    if (pgflag) {
+        /* extract serial device name from output path for log message */
+        for (i=1;i<=n;i++) {
+            if (types[i]==STR_SERIAL) {
+                strncpy(serialdev,paths[i],sizeof(serialdev)-1);
+                break;
+            }
+        }
+        /* test if serial is accessible */
+        {
+            char devpath[256];
+            char *colon;
+            sprintf(devpath,"/dev/%.*s",(int)(sizeof(devpath)-6),serialdev);
+            if ((colon=strchr(devpath,':'))) *colon='\0';
+            if (access(devpath,F_OK)!=0) {
+                fprintf(stderr,"[GPS] cannot open serial://%s\n",serialdev);
+                if (stapos_set) {
+                    fprintf(stderr,"[GPS] serial unavailable, using -p position as fallback\n");
+                    lock(&strsvr.nmeapos_lock);
+                    matcpy(strsvr.nmeapos,stapos,3,1);
+                    strsvr.nmeapos_valid=1;
+                    unlock(&strsvr.nmeapos_lock);
+                    gps_ready=1;
+                } else {
+                    fprintf(stderr,"failed to get initial position\n");
+                }
+                pgflag=0; /* disable pipe — serial not available */
+            }
+        }
+    }
+
+    /* if -p given without -pg, position is immediately valid */
+    if (stapos_set&&!pgflag) strsvr.nmeapos_valid=1;
+
+    if (pgflag) {
+        fprintf(stderr,"[GPS] pipe\n");
+        if (pipe(nmea_pipe)<0) {
+            fprintf(stderr,"pipe error\n");
+            return -1;
+        }
+        fcntl(nmea_pipe[1],F_SETFL,O_NONBLOCK);
+        strsvr.serial_pipe_fd=nmea_pipe[1];
+    }
+
     if (trlevel>0) {
         traceopen(*logfile?logfile:TRFILE);
         tracelevel(trlevel);
     }
     fprintf(stderr,"stream server start\n");
-    
+
     strsetdir(local);
     strsetproxy(proxy);
-    
+
     for (i=0;i<MAXSTR;i++) {
         if (*cmdfile[i]) readcmd(cmdfile[i],cmds[i],0);
         if (*cmdfile[i]) readcmd(cmdfile[i],cmds_periodic[i],2);
@@ -322,17 +582,44 @@ int main(int argc, char **argv)
         fprintf(stderr,"stream server start error\n");
         return -1;
     }
+
+    /* start NMEA TCP server */
+    if (nmea_svr_port>0) {
+        nmeatcp=nmea_server_start(nmea_svr_host,nmea_svr_port,NULL);
+        if (nmeatcp<0) {
+            fprintf(stderr,"[NMEA] invalid port: %s\n",nmea_svr_host);
+        } else {
+            if (pthread_create(&nmea_tid,NULL,nmea_accept_thread,&nmeatcp)) {
+                fprintf(stderr,"[NMEA] accept thread error\n");
+            } else {
+                pthread_detach(nmea_tid);
+            }
+        }
+    }
+
+    /* start GPS position thread and wait for first fix */
+    if (pgflag) {
+        if (pthread_create(&gps_tid,NULL,gps_pos_thread,&nmea_pipe[0])) {
+            fprintf(stderr,"[GPS] thread error\n");
+        } else {
+            pthread_detach(gps_tid);
+        }
+        if (!gps_ready) {
+            wait_initial_position(serialdev);
+        }
+    }
+
     for (intrflg=0;!intrflg;) {
-        
+
         /* get stream server status */
         strsvrstat(&strsvr,stat,log_stat,byte,bps,strmsg);
-        
+
         /* show stream server status */
         for (i=0,p=buff;i<MAXSTR;i++) p+=sprintf(p,"%c",ss[stat[i]+1]);
-        
+
         fprintf(stderr,"%s [%s] %10d B %7d bps %s\n",
                 time_str(utc2gpst(timeget()),0),buff,byte[0],bps[0],strmsg);
-        
+
         sleepms(dispint);
     }
     for (i=0;i<MAXSTR;i++) {
@@ -340,7 +627,21 @@ int main(int argc, char **argv)
     }
     /* stop stream server */
     strsvrstop(&strsvr,cmds);
-    
+
+    /* close NMEA server */
+    if (nmeatcp>=0) close(nmeatcp);
+    pthread_mutex_lock(&nmea_mutex);
+    for (i=0;i<nmea_nclient;i++) close(nmea_clients[i]);
+    nmea_nclient=0;
+    pthread_mutex_unlock(&nmea_mutex);
+
+    /* close pipe */
+    if (nmea_pipe[1]>=0) {
+        strsvr.serial_pipe_fd=-1;
+        close(nmea_pipe[1]);
+    }
+    if (nmea_pipe[0]>=0) close(nmea_pipe[0]);
+
     for (i=0;i<n;i++) {
         strconvfree(conv[i]);
     }

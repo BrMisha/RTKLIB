@@ -1217,6 +1217,9 @@ typedef struct {        /* stream server type */
     strconv_t *conv[16]; /* stream converter */
     thread_t thread;    /* server thread */
     lock_t lock;        /* lock flag */
+    int serial_pipe_fd;  /* pipe write end for serial NMEA (-1: disabled) */
+    lock_t nmeapos_lock; /* lock for nmeapos */
+    int nmeapos_valid;   /* nmeapos is valid and ready to send (0: hold) */
 } strsvr_t;
 
 typedef struct {        /* RTK server type */
